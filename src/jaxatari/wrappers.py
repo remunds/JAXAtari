@@ -41,7 +41,7 @@ class AtariWrapper(JaxatariWrapper):
         frame_skip: The number of frames to skip.
     """
     # TODO: change sticky_actions to float
-    def __init__(self, env, sticky_actions: bool = True, frame_stack_size: int = 4, frame_skip: int = 4, max_episode_length: int = 10_000, episodic_life: bool = True, first_fire: bool = True, noop_reset: int = 0, clip_reward: bool = False, max_pooling: bool = False):
+    def __init__(self, env, sticky_actions: bool = True, frame_stack_size: int = 4, frame_skip: int = 4, max_episode_length: int = 10_000, episodic_life: bool = True, first_fire: bool = True, noop_reset: int = 0, clip_reward: bool = False, max_pooling: bool = False, detect_prob: float = 1.0, std_dev: float = 0.0):
         super().__init__(env)
         self._env = env
         self.sticky_actions = sticky_actions
@@ -54,6 +54,8 @@ class AtariWrapper(JaxatariWrapper):
         self.noop_max = noop_reset
         self.clip_reward = clip_reward
         self.max_pooling = max_pooling
+        self.detect_prob = detect_prob
+        self.std_dev = std_dev
 
         self._observation_space = spaces.stack_space(self._env.observation_space(), self.frame_stack_size)
 
@@ -64,12 +66,45 @@ class AtariWrapper(JaxatariWrapper):
     def image_space(self) -> spaces.Box:
         """Returns the image space."""
         return self._env.image_space()
+    
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def add_noise(self, obs: chex.Array, key: chex.PRNGKey) -> EnvState:
+        """Adds observation noise to the observation.""" 
+
+        # Add Gaussian noise to each leaf in the observation pytree
+        def add_noise_fn(obs_leaf, k):
+            leaf_dtype = obs_leaf.dtype
+            noise = jax.random.normal(k, shape=obs_leaf.shape) * self.std_dev
+            noisy_obs = obs_leaf + noise
+            return noisy_obs.astype(leaf_dtype)
+
+        noise_key, drop_key = jax.random.split(key)
+        treedef = jax.tree.structure(obs)
+        keys = jax.random.split(noise_key, treedef.num_leaves) 
+        keys_tree = jax.tree.unflatten(treedef, keys)
+        obs = jax.tree.map(add_noise_fn, obs, keys_tree)
+
+        # Randomly drop the observation with probability (1 - detect_prob)
+        def drop_obs_fn(obs_leaf, k):
+            leaf_dtype = obs_leaf.dtype
+            obs_leaf = jax.lax.cond(
+                jax.random.bernoulli(k, p=self.detect_prob),
+                lambda: obs_leaf,
+                lambda: jnp.zeros_like(obs_leaf), 
+            )
+            return obs_leaf.astype(leaf_dtype)
+        keys = jax.random.split(drop_key, len(jax.tree.leaves(obs)))
+        keys_tree = jax.tree.unflatten(treedef, keys)
+        obs = jax.tree.map(drop_obs_fn, obs, keys_tree)
+        return obs
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
         # Split keys for all potential random operations
         env_key, wrapper_key, noop_key = jax.random.split(key, 3)
         obs, env_state = self._env.reset(env_key)
+        if self.std_dev > 0.0 or self.detect_prob < 1.0:
+            obs = self.add_noise(obs, wrapper_key)
         step = jnp.array(0, dtype=jnp.int32)
         prev_action = jnp.array(0, dtype=jnp.int32)
 
@@ -140,6 +175,8 @@ class AtariWrapper(JaxatariWrapper):
         def body_fn(carry, _):
             env_state, action = carry
             obs, new_env_state, reward, done, info = self._env.step(env_state, action) 
+            if self.std_dev > 0.0 or self.detect_prob < 1.0:
+                obs = self.add_noise(obs, step_key)
             return (new_env_state, action), (obs, reward, done, info)
 
         (new_env_state, new_action), (obs, rewards, dones, infos) = jax.lax.scan(
@@ -758,3 +795,61 @@ class MultiRewardLogWrapper(JaxatariWrapper):
         info["returned_episode_lengths"] = state.returned_episode_lengths
         info["returned_episode"] = done
         return obs, state, reward, done, info
+
+class NoiseWrapper(JaxatariWrapper):
+    """Add Gaussian noise to the observations."""
+
+    def __init__(self, env, noise_std: float = 0.1):
+        super().__init__(env)
+        self.object_centric = isinstance(env, ObjectCentricWrapper)
+        self.pixel_obs = isinstance(env, PixelObsWrapper)
+        self.both = isinstance(env, PixelAndObjectCentricWrapper)
+
+        # Choose viable default noise std
+        if self.object_centric:
+            # for object-centric observations, a higher noise std is more appropriate
+            self.noise_std = 1.0
+        elif self.pixel_obs:
+            # for pixel observations, a lower noise std is more appropriate
+            self.noise_std = 0.1
+        elif self.both:
+            self.noise_std = (0.1, 1.0)
+        else:
+            raise ValueError("NoiseWrapper must be applied after ObjectCentricWrapper, PixelObsWrapper, or PixelAndObjectCentricWrapper")
+
+        if noise_std is not None:
+            self.noise_std = noise_std
+    
+    def transform_obs(self, obs, key: chex.PRNGKey) -> chex.Array:
+        if self.object_centric or self.pixel_obs:
+            noise = jax.random.normal(key, shape=obs.shape) * self.noise_std
+            noisy_obs = obs + noise
+        if self.object_centric:
+            # Ensure object-centric observations are positive uint8s 
+            noisy_obs = jnp.clip(noisy_obs, min=0).astype(jnp.uint8) 
+        elif self.pixel_obs:
+            # Ensure pixel observations are uint8s between 0 and 255 
+            noisy_obs = jnp.clip(noisy_obs, 0, 255).astype(jnp.uint8)
+
+        else: # self.both
+            noise_px = jax.random.normal(key, shape=obs[0].shape) * self.noise_std[0]
+            noise_oc = jax.random.normal(key, shape=obs[1].shape) * self.noise_std[1]
+            px_obs = jnp.clip(obs[0] + noise_px, 0, 255).astype(jnp.uint8)
+            oc_obs = jnp.clip(obs[1] + noise_oc, min=0).astype(jnp.uint8)
+            noisy_obs = (px_obs, oc_obs)
+        return noisy_obs
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
+        obs, state = self._env.reset(key)
+        return self.transform_obs(obs, key), state
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def step(
+        self,
+        state: Any,
+        action: Union[int, float],
+    ) -> Tuple[chex.Array, Any, float, bool, Dict[str, Any]]:
+        step_key, _ = jax.random.split(state.key)
+        obs, next_state, reward, done, info = self._env.step(state, action)
+        return self.transform_obs(obs, step_key), next_state, reward, done, info
