@@ -8,7 +8,7 @@ from flax import struct
 import jax
 import jax.image as jim
 import jax.numpy as jnp
-from jaxatari.environment import EnvState, JAXAtariAction as Action
+from jaxatari.environment import EnvState, EnvObs, JAXAtariAction as Action
 import jaxatari.spaces as spaces
 import numpy as np
 
@@ -29,6 +29,7 @@ class AtariState:
     step: int
     prev_action: int
     obs_stack: chex.Array
+    dropped: chex.Array #(frame_stack_size, num_leaves) boolean array indicating which leaves were dropped
     
 class AtariWrapper(JaxatariWrapper):
     """
@@ -68,8 +69,10 @@ class AtariWrapper(JaxatariWrapper):
         return self._env.image_space()
     
     @functools.partial(jax.jit, static_argnums=(0,))
-    def add_noise(self, obs: chex.Array, key: chex.PRNGKey) -> EnvState:
-        """Adds observation noise to the observation.""" 
+    def add_noise(self, dropped: chex.PyTreeDef, obs_stack: chex.PyTreeDef, key: chex.PRNGKey) -> Tuple[bool, EnvState]:
+        """Adds observation noise to the latest observation.""" 
+        current_obs = jax.tree.map(lambda x: x[-1], obs_stack)
+        prev_obs = jax.tree.map(lambda x: x[-2], obs_stack)
 
         # Add Gaussian noise to each leaf in the observation pytree
         def add_noise_fn(obs_leaf, k):
@@ -79,32 +82,48 @@ class AtariWrapper(JaxatariWrapper):
             return noisy_obs.astype(leaf_dtype)
 
         noise_key, drop_key = jax.random.split(key)
-        treedef = jax.tree.structure(obs)
+        treedef = jax.tree.structure(current_obs)
         keys = jax.random.split(noise_key, treedef.num_leaves) 
         keys_tree = jax.tree.unflatten(treedef, keys)
-        obs = jax.tree.map(add_noise_fn, obs, keys_tree)
+        obs = jax.tree.map(add_noise_fn, current_obs, keys_tree)
 
         # Randomly drop the observation with probability (1 - detect_prob)
-        def drop_obs_fn(obs_leaf, k):
+        def drop_obs_fn(obs_leaf, old_obs_leaf, drop_leaf, k):
             leaf_dtype = obs_leaf.dtype
+            cond = jax.random.bernoulli(k, p=self.detect_prob)
+            # update dropped status
+            drop_leaf = jax.lax.cond(
+                cond,
+                lambda: jnp.concatenate([drop_leaf[1:], jnp.expand_dims(jnp.array(False), axis=0)], axis=0),
+                lambda: jnp.concatenate([drop_leaf[1:], jnp.expand_dims(jnp.array(True), axis=0)], axis=0)
+            ) 
+            # update leaf
             obs_leaf = jax.lax.cond(
-                jax.random.bernoulli(k, p=self.detect_prob),
-                lambda: obs_leaf,
-                lambda: jnp.zeros_like(obs_leaf), 
+                cond,
+                lambda: obs_leaf, # keep the observation
+                lambda: jax.lax.cond(
+                    drop_leaf.sum() >= 4,
+                    lambda: jnp.zeros_like(obs_leaf), # all previous dropped, set to zero
+                    lambda: old_obs_leaf # use previous observation
+                ) # drop the observation
             )
-            return obs_leaf.astype(leaf_dtype)
+            return (obs_leaf.astype(leaf_dtype), drop_leaf)
+
         keys = jax.random.split(drop_key, len(jax.tree.leaves(obs)))
         keys_tree = jax.tree.unflatten(treedef, keys)
-        obs = jax.tree.map(drop_obs_fn, obs, keys_tree)
-        return obs
+        drop_obs = jax.tree.map(drop_obs_fn, obs, prev_obs, dropped, keys_tree)
+        is_a_tuple = lambda x: isinstance(x, tuple) and isinstance(x[1], jnp.ndarray)
+        new_obs = jax.tree.map(lambda x: x[0], drop_obs, is_leaf=is_a_tuple)
+        dropped = jax.tree.map(lambda x: x[1], drop_obs, is_leaf=is_a_tuple)
+        # replace obs_stack -1 with new
+        obs_stack = jax.tree.map(lambda stack, new_leaf: jnp.concatenate([stack[:-1], jnp.expand_dims(new_leaf, axis=0)], axis=0), obs_stack, new_obs)
+        return dropped, obs_stack
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
+    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, AtariState]:
         # Split keys for all potential random operations
         env_key, wrapper_key, noop_key = jax.random.split(key, 3)
         obs, env_state = self._env.reset(env_key)
-        if self.std_dev > 0.0 or self.detect_prob < 1.0:
-            obs = self.add_noise(obs, wrapper_key)
         step = jnp.array(0, dtype=jnp.int32)
         prev_action = jnp.array(0, dtype=jnp.int32)
 
@@ -159,8 +178,13 @@ class AtariWrapper(JaxatariWrapper):
 
         # Create the initial frame stack from the final observation.
         obs = jax.tree.map(lambda x: jnp.stack([x] * self.frame_stack_size), obs)
+        print("len obs: ", len(obs))
+        dropped = jax.tree.map(lambda _: jnp.zeros((self.frame_stack_size,), dtype=jnp.bool_), obs)
+        if self.std_dev > 0.0 or self.detect_prob < 1.0:
+            dropped, obs = self.add_noise(dropped, obs, wrapper_key)
+            print(obs)
 
-        return obs, AtariState(env_state, wrapper_key, step, prev_action, obs)
+        return obs, AtariState(env_state, wrapper_key, step, prev_action, obs, dropped)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(self, state: AtariState, action: Union[int, float]) -> Tuple[Tuple[chex.Array, chex.Array], AtariState, float, bool, Dict[Any, Any]]:
@@ -174,9 +198,7 @@ class AtariWrapper(JaxatariWrapper):
         # use scan to step the env for frame_skip times
         def body_fn(carry, _):
             env_state, action = carry
-            obs, new_env_state, reward, done, info = self._env.step(env_state, action) 
-            if self.std_dev > 0.0 or self.detect_prob < 1.0:
-                obs = self.add_noise(obs, step_key)
+            obs, new_env_state, reward, done, info = self._env.step(env_state, action)
             return (new_env_state, action), (obs, reward, done, info)
 
         (new_env_state, new_action), (obs, rewards, dones, infos) = jax.lax.scan(
@@ -202,6 +224,11 @@ class AtariWrapper(JaxatariWrapper):
 
         # push latest obs into the stack
         new_obs_stack = jax.tree.map(lambda stack, obs_leaf: jnp.concatenate([stack[1:], jnp.expand_dims(obs_leaf, axis=0)], axis=0), state.obs_stack, latest_obs)
+
+        if self.std_dev > 0.0 or self.detect_prob < 1.0:
+            dropped, new_obs_stack = self.add_noise(state.dropped, new_obs_stack, step_key)
+        else:
+            dropped = state.dropped
 
         reward = jnp.sum(rewards)
         done = jnp.logical_or(dones.any(), state.step >= self.max_episode_length)
@@ -234,7 +261,7 @@ class AtariWrapper(JaxatariWrapper):
 
         def _step_fn(_):
             # When not done, create the next state, passing next_state_key for the *next* step.
-            next_state = AtariState(new_env_state, next_state_key, state.step + 1, new_action, new_obs_stack)
+            next_state = AtariState(new_env_state, next_state_key, state.step + 1, new_action, new_obs_stack, dropped)
             return new_obs_stack, next_state
 
         new_obs, new_state = jax.lax.cond(done, _reset_fn, _step_fn, operand=None)
@@ -306,6 +333,8 @@ class ObjectCentricWrapper(JaxatariWrapper):
     ) -> Tuple[chex.Array, EnvState]:
         obs, state = self._env.reset(key)
         # Flatten each frame in the stack
+        print("obs: ", obs)
+        print("len obs: ", len(obs))
         flat_obs = jax.vmap(self._env.obs_to_flat_array)(obs)
         return flat_obs, state
 
