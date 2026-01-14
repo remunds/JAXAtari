@@ -178,11 +178,9 @@ class AtariWrapper(JaxatariWrapper):
 
         # Create the initial frame stack from the final observation.
         obs = jax.tree.map(lambda x: jnp.stack([x] * self.frame_stack_size), obs)
-        print("len obs: ", len(obs))
         dropped = jax.tree.map(lambda _: jnp.zeros((self.frame_stack_size,), dtype=jnp.bool_), obs)
         if self.std_dev > 0.0 or self.detect_prob < 1.0:
             dropped, obs = self.add_noise(dropped, obs, wrapper_key)
-            print(obs)
 
         return obs, AtariState(env_state, wrapper_key, step, prev_action, obs, dropped)
 
